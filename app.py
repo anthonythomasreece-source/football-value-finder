@@ -1,43 +1,18 @@
-import time
+import os
 import requests
+from flask import Flask, render_template_string
+from dotenv import load_dotenv
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
-API_KEY = "YOUR_THE_ODDS_API_KEY"  # Replace with your API key
+# 1. Load Environment Variables securely
+load_dotenv()
+API_KEY = os.getenv("THE_ODDS_API_KEY")
+
+app = Flask(__name__)
+
 BASE_URL = "https://api.the-odds-api.com/v4/sports"
 
-# Target regions & market parameters
-REGIONS = "uk,eu"       # Mandatory parameter to return bookies like Betfair, Bet365, Unibet, etc.
-MARKETS = "h2h"         # 1X2 / Match Winner odds
-ODDS_FORMAT = "decimal"
-MIN_EV_THRESHOLD = 0.02 # 2.0% minimum Positive EV threshold (e.g., 0.02 = 2%)
-
-# Targeted list of European & domestic soccer league keys
-LEAGUES_TO_SCAN = [
-    "soccer_epl",                       # English Premier League
-    "soccer_england_league1",           # EFL League One
-    "soccer_england_league2",           # EFL League Two
-    "soccer_spain_la_liga",             # La Liga
-    "soccer_germany_bundesliga",        # Bundesliga
-    "soccer_italy_serie_a",             # Serie A
-    "soccer_france_ligue_one",          # Ligue 1
-    "soccer_netherlands_eredivisie",    # Eredivisie
-    "soccer_portugal_primeira_liga",    # Primeira Liga
-    "soccer_belgium_first_div",         # Belgian Pro League
-    "soccer_turkey_super_league",       # Süper Lig
-    "soccer_austria_bundesliga",        # Austrian Bundesliga
-    "soccer_switzerland_super_league",  # Swiss Super League
-    "soccer_uefa_champs_league",        # UEFA Champions League
-    "soccer_uefa_europa_league"         # UEFA Europa League
-]
-
-# ==========================================
-# HELPER FUNCTIONS
-# ==========================================
-
 def calculate_no_vig_probs(home_odds, draw_odds, away_odds):
-    """Removes the bookmaker margin to derive true no-vig probabilities."""
+    """Removes bookmaker margin to derive fair implied probabilities."""
     raw_sum = (1 / home_odds) + (1 / draw_odds) + (1 / away_odds)
     return {
         "home": (1 / home_odds) / raw_sum,
@@ -45,48 +20,58 @@ def calculate_no_vig_probs(home_odds, draw_odds, away_odds):
         "away": (1 / away_odds) / raw_sum
     }
 
-def scan_leagues():
+def get_active_soccer_leagues():
+    """Dynamically fetches all currently active soccer leagues to avoid 0-fixture errors."""
+    if not API_KEY:
+        print("❌ Error: THE_ODDS_API_KEY environment variable is missing.")
+        return []
+        
+    url = f"{BASE_URL}/?apiKey={API_KEY}"
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            print(f"❌ Error fetching sports list: HTTP {response.status_code}")
+            return []
+        
+        sports = response.json()
+        # Filter strictly for active soccer/football leagues
+        active_soccer = [s["key"] for s in sports if s.get("group") == "Soccer" and s.get("active")]
+        return active_soccer
+    except Exception as e:
+        print(f"❌ Error connecting to API: {e}")
+        return []
+
+def scan_ev_bets():
+    if not API_KEY:
+        return 0, 0, [], "API Key is missing. Please set THE_ODDS_API_KEY in your .env file."
+
+    leagues_to_scan = get_active_soccer_leagues()
+    if not leagues_to_scan:
+        return 0, 0, [], "No active soccer leagues found or API key quota exceeded."
+
     leagues_scanned = 0
     fixtures_processed = 0
-    positive_ev_found = 0
     ev_bets = []
 
-    print("🚀 Starting +EV Football Scanner...\n")
-
-    for sport_key in LEAGUES_TO_SCAN:
+    for sport_key in leagues_to_scan:
         leagues_scanned += 1
         url = f"{BASE_URL}/{sport_key}/odds/"
-        
-        # Mandatory parameters required by The Odds API
         params = {
             "apiKey": API_KEY,
-            "regions": REGIONS,
-            "markets": MARKETS,
-            "oddsFormat": ODDS_FORMAT
+            "regions": "uk,eu",
+            "markets": "h2h",
+            "oddsFormat": "decimal"
         }
 
         try:
-            response = requests.get(url, params=params)
-            
-            # API rate limit check
-            if response.status_code == 429:
-                print(f"⚠️ Rate limit hit on {sport_key}. Sleeping 2 seconds...")
-                time.sleep(2)
-                continue
-            elif response.status_code != 200:
-                print(f"❌ Error fetching {sport_key}: HTTP {response.status_code}")
+            res = requests.get(url, params=params)
+            if res.status_code != 200:
                 continue
 
-            fixtures = response.json()
-            
-            # If empty array returned, log and continue
-            if not isinstance(fixtures, list) or len(fixtures) == 0:
-                print(f" [–] {sport_key}: 0 active fixtures found in time window.")
+            fixtures = res.json()
+            if not isinstance(fixtures, list):
                 continue
 
-            print(f" [+] {sport_key}: Found {len(fixtures)} active fixtures.")
-
-            # Process each fixture in the league
             for fixture in fixtures:
                 fixtures_processed += 1
                 home_team = fixture.get("home_team")
@@ -96,21 +81,23 @@ def scan_leagues():
                 if not bookmakers:
                     continue
 
-                # Find sharp reference line (Pinnacle preferred, fallback to market average)
-                pinnacle_data = next((b for b in bookmakers if b["key"] == "pinnacle"), None)
-                
+                # Find Pinnacle for sharp market benchmark
+                pinnacle = next((b for b in bookmakers if b["key"] == "pinnacle"), None)
                 fair_probs = None
-                if pinnacle_data:
-                    h2h_market = next((m for m in pinnacle_data["markets"] if m["key"] == "h2h"), None)
-                    if h2h_market and len(h2h_market["outcomes"]) == 3:
-                        p_home = next(o["price"] for o in h2h_market["outcomes"] if o["name"] == home_team)
-                        p_draw = next(o["price"] for o in h2h_market["outcomes"] if o["name"] == "Draw")
-                        p_away = next(o["price"] for o in h2h_market["outcomes"] if o["name"] == away_team)
-                        fair_probs = calculate_no_vig_probs(p_home, p_draw, p_away)
+                
+                if pinnacle:
+                    h2h = next((m for m in pinnacle["markets"] if m["key"] == "h2h"), None)
+                    if h2h and len(h2h["outcomes"]) == 3:
+                        try:
+                            p_home = next(o["price"] for o in h2h["outcomes"] if o["name"] == home_team)
+                            p_draw = next(o["price"] for o in h2h["outcomes"] if o["name"] == "Draw")
+                            p_away = next(o["price"] for o in h2h["outcomes"] if o["name"] == away_team)
+                            fair_probs = calculate_no_vig_probs(p_home, p_draw, p_away)
+                        except StopIteration:
+                            pass
 
-                # Scan all soft/retail bookmakers against true probability
+                # Scan soft books
                 for bookie in bookmakers:
-                    # Skip sharp benchmark book
                     if bookie["key"] == "pinnacle":
                         continue
 
@@ -122,7 +109,6 @@ def scan_leagues():
                         selection = outcome["name"]
                         book_odds = outcome["price"]
 
-                        # Target probability mapping
                         if fair_probs:
                             if selection == home_team:
                                 true_prob = fair_probs["home"]
@@ -131,43 +117,109 @@ def scan_leagues():
                             else:
                                 true_prob = fair_probs["draw"]
 
-                            # Expected Value Calculation: EV = (Odds * True_Prob) - 1
                             ev = (book_odds * true_prob) - 1
 
-                            if ev >= MIN_EV_THRESHOLD:
-                                positive_ev_found += 1
+                            if ev >= 0.02:  # +2.0% EV Threshold
                                 ev_bets.append({
                                     "match": f"{home_team} vs {away_team}",
-                                    "league": sport_key,
+                                    "league": sport_key.replace("soccer_", "").replace("_", " ").title(),
                                     "bookmaker": bookie["title"],
                                     "selection": selection,
                                     "odds": book_odds,
                                     "fair_odds": round(1 / true_prob, 2),
                                     "ev_percent": f"{round(ev * 100, 2)}%"
                                 })
-
         except Exception as e:
-            print(f"❌ Unexpected error scanning {sport_key}: {e}")
+            print(f"Error processing {sport_key}: {e}")
 
-        # Respect request throttling
-        time.sleep(0.2)
+    return leagues_scanned, fixtures_processed, ev_bets, None
 
-    # Output Scan Summary
-    print("\n" + "=" * 45)
-    print(" SCANNING COMPLETE")
-    print("=" * 45)
-    print(f"Leagues Scanned      = {leagues_scanned}")
-    print(f"Fixtures Processed   = {fixtures_processed}")
-    print(f"Positive EV Bets Found = {positive_ev_found}")
-    print("=" * 45)
+# Basic Responsive HTML UI Template
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>+EV Value Betting Dashboard</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 40px; background: #f4f6f8; color: #333; }
+        .card { background: white; padding: 24px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 24px; }
+        .stats { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-box { background: #eef2f5; padding: 15px 20px; border-radius: 6px; flex: 1; }
+        .stat-number { font-size: 24px; font-weight: bold; color: #0066cc; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background: #f8f9fa; }
+        .badge { background: #28a745; color: white; padding: 4px 8px; border-radius: 4px; font-weight: bold; }
+        .error { background: #f8d7da; color: #721c24; padding: 15px; border-radius: 6px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>⚽ +EV Football Scanner Dashboard</h2>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% else %}
+            <div class="stats">
+                <div class="stat-box">
+                    <div>Leagues Scanned</div>
+                    <div class="stat-number">{{ leagues_scanned }}</div>
+                </div>
+                <div class="stat-box">
+                    <div>Fixtures Processed</div>
+                    <div class="stat-number">{{ fixtures_processed }}</div>
+                </div>
+                <div class="stat-box">
+                    <div>+EV Bets Found</div>
+                    <div class="stat-number">{{ ev_bets|length }}</div>
+                </div>
+            </div>
 
-    if ev_bets:
-        print("\n🎯 Found +EV Opportunities:")
-        for bet in ev_bets:
-            print(f"• {bet['match']} ({bet['league']})")
-            print(f"  Selection: {bet['selection']} @ {bet['odds']} [{bet['bookmaker']}]")
-            print(f"  Fair Odds: {bet['fair_odds']} | Expected Value: {bet['ev_percent']}\n")
+            {% if ev_bets %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Match</th>
+                            <th>League</th>
+                            <th>Selection</th>
+                            <th>Bookmaker</th>
+                            <th>Odds</th>
+                            <th>Fair Odds</th>
+                            <th>Expected Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for bet in ev_bets %}
+                        <tr>
+                            <td><b>{{ bet.match }}</b></td>
+                            <td>{{ bet.league }}</td>
+                            <td>{{ bet.selection }}</td>
+                            <td>{{ bet.bookmaker }}</td>
+                            <td><b>{{ bet.odds }}</b></td>
+                            <td>{{ bet.fair_odds }}</td>
+                            <td><span class="badge">+{{ bet.ev_percent }}</span></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>No positive EV opportunities found right now across current active leagues.</p>
+            {% endif %}
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
 
-# Run Scanner
-if __name__ == "__main__":
-    scan_leagues()
+@app.route('/')
+def home():
+    scanned, processed, bets, error = scan_ev_bets()
+    return render_template_string(
+        HTML_TEMPLATE,
+        leagues_scanned=scanned,
+        fixtures_processed=processed,
+        ev_bets=bets,
+        error=error
+    )
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
